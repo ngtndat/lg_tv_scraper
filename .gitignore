@@ -1,0 +1,7 @@
+*.csv
+debug_tv/
+credentials.json
+service_account.json
+secret.json
+.env
+__pycache__/
