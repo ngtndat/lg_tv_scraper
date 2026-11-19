@@ -55,6 +55,9 @@ SITES = {
         "title": "DMX",
         "list_url": "https://www.dienmayxanh.com/tivi-lg",
         "link_sel": "[data-product-code] a[title], a.main-contain",
+        "card_sel": "[data-product-code]",
+        "list_sell_sel": "a.text-red-7 > span",
+        "list_mrp_sel": "del",
         "accept": lambda path, title: path.startswith("/tivi") and path.count("/") >= 2,
         "sell_sel": [".box-price-present", ".bs_price strong", ".price-one .box-price-present"],
         "mrp_sel": [".box-price-old", ".bs_price em", ".price-old"],
@@ -63,6 +66,10 @@ SITES = {
         "title": "DMCL",
         "list_url": "https://dienmaycholon.com/tivi-lg",
         "link_sel": "a.product-card, a:has(h3)",
+        "card_sel": "a.product-card",
+        "list_sell_sel": ".product-price-new",
+        "list_mrp_sel": ".product-price-old",
+        "prefer_listing": True,
         "accept": lambda path, title: len(path.strip("/")) > 5 and "tivi" in path.lower(),
         "sell_sel": [".info_pro_price .price_sale", ".box_price_layout_cost strong", ".price_sale",
                      ".product-price-new"],
@@ -72,9 +79,11 @@ SITES = {
         "title": "NguyenKim",
         "list_url": "https://www.nguyenkim.com/tivi.c?property=thuong-hieu-brand:LG",
         "link_sel": "a[href]",
-        "accept": lambda path, title: (path.count("/") == 1 and "lg" in path.lower()
-                                       and ("tivi" in path.lower() or "tv" in path.lower())
-                                       and re.search(r"\d", path.split("-")[-1]) is not None),
+        "accept": lambda path, title: (path.count("/") == 1
+                                       and re.search(r"\d", path.rsplit("-", 1)[-1]) is not None
+                                       and "lg" in f"{path} {title}".lower()
+                                       and ("tivi" in f"{path} {title}".lower()
+                                            or "tv" in f"{path} {title}".lower())),
         "sell_sel": [],
         "mrp_sel": [],
     },
@@ -123,8 +132,18 @@ def dump(page, site, tag):
         log(f"    [debug] khong luu duoc {tag}: {e}")
 
 
-def goto(page, url, timeout=60000):
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+def goto(page, url, timeout=45000, retries=3):
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * attempt)
+            break
+        except Exception as e:
+            last = e
+            log(f"    [goto] lan {attempt}/{retries} loi: {str(e).splitlines()[0]}")
+            time.sleep(3 * attempt)
+    else:
+        raise last
     try:
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
@@ -145,15 +164,25 @@ def new_context(browser):
 def collect_links(page, cfg, found):
     rows = page.eval_on_selector_all(
         cfg["link_sel"],
-        "els => els.map(e => ({href: e.href, title: e.getAttribute('title') || e.innerText || ''}))")
+        """(els, a) => els.map(e => {
+             const card = (a[0] && e.closest(a[0])) || e;
+             const t = s => { const n = s && card.querySelector(s); return n ? n.innerText : '' };
+             return {href: e.href, title: e.getAttribute('title') || e.innerText || '',
+                     sell: t(a[1]), mrp: t(a[2])};
+           })""",
+        [cfg.get("card_sel"), cfg.get("list_sell_sel"), cfg.get("list_mrp_sel")])
     for r in rows:
         href = (r.get("href") or "").split("?")[0].split("#")[0]
         if not href.startswith("http"):
             continue
         path = urlparse(href).path
         title = clean_text(r.get("title"))
-        if cfg["accept"](path, title) and href not in found:
-            found[href] = title
+        if not cfg["accept"](path, title):
+            continue
+        info = found.setdefault(href, {"title": title, "sell": 0, "mrp": 0})
+        info["title"] = info["title"] or title
+        info["sell"] = info["sell"] or to_int(r.get("sell"))
+        info["mrp"] = info["mrp"] or to_int(r.get("mrp"))
 
 
 def find_more_button(page):
@@ -397,7 +426,7 @@ def checkout_price(browser, url, site):
 # ------------------------------------------------------------------------------
 COLUMNS = ["Giờ quét", "Page Title", "Mã Model", "Tên Model", "Status", "direct product link",
            "MRP price", "Selling price", "Giá cuối (cổng thanh toán)", "Giá thấp nhất sau voucher",
-           "Chi tiết thanh toán", "Voucher / khuyến mãi"]
+           "Chi tiết thanh toán", "Voucher / khuyến mãi", "Giá trên listing", "Ghi chú"]
 
 
 def scrape_site(browser, key, limit, checkout, writer, fh):
@@ -407,18 +436,32 @@ def scrape_site(browser, key, limit, checkout, writer, fh):
     page = ctx.new_page()
     try:
         goto(page, cfg["list_url"])
+        try:
+            page.wait_for_function("document.querySelectorAll('a[href]').length > 30", timeout=15000)
+        except Exception:
+            pass
         links = expand_listing(page, cfg, key)
         dump(page, key, "listing")
+        if not links:
+            hrefs = page.eval_on_selector_all(
+                "a[href]", "els => [...new Set(els.map(e => e.getAttribute('href')))].slice(0, 25)")
+            log(f"[{key}] 0 link. title={page.title()!r} url={page.url}")
+            log(f"[{key}] noi dung dau trang: {clean_text(page.inner_text('body'))[:300]!r}")
+            log(f"[{key}] mau href: {hrefs}")
     finally:
         ctx.close()
-    items = [(u, t) for u, t in links.items() if not t or "lg" in t.lower() or key == "NK"]
+    items = [(u, i) for u, i in links.items()
+             if not i["title"] or "lg" in i["title"].lower() or key == "NK"]
     log(f"[{key}] tim thay {len(items)} san pham" + (f" (gioi han {limit})" if limit else ""))
     if limit:
         items = items[:limit]
 
     rows = []
-    for i, (url, _) in enumerate(items, 1):
+    for i, (url, info) in enumerate(items, 1):
         log(f"[{key} {i}/{len(items)}] {url}")
+        ls, lm = info["sell"], info["mrp"] or info["sell"]
+        notes = []
+        d = None
         ctx = new_context(browser)
         try:
             page = ctx.new_page()
@@ -426,19 +469,31 @@ def scrape_site(browser, key, limit, checkout, writer, fh):
             d = parse_detail(page, cfg, url)
             dump(page, key, slugify(url) + "_detail")
         except Exception as e:
-            log(f"    [!] loi trang chi tiet: {e}")
-            continue
+            log(f"    [!] loi trang chi tiet: {str(e).splitlines()[0]}")
+            notes.append("loi trang chi tiet, dung gia listing")
         finally:
             ctx.close()
+
+        if d is None:
+            d = {"name": info["title"] or "N/A", "sell": ls, "mrp": lm,
+                 "status": "chưa lấy được chi tiết", "vouchers": []}
+        else:
+            if ls and d["sell"] and ls != d["sell"]:
+                notes.append(f"lech gia: listing {ls:,} vs chi tiet {d['sell']:,}")
+            if (cfg.get("prefer_listing") and ls) or (ls and not d["sell"]):
+                d["sell"], d["mrp"] = ls, lm
 
         co = {"final": 0, "min": 0, "steps": "", "vouchers": []}
         if checkout and d["sell"] and d["status"] == "Đang kinh doanh":
             co = checkout_price(browser, url, key)
+            if co["final"] and co["final"] > d["sell"]:
+                notes.append("gia cuoi > gia ban: kiem tra lai")
         vouchers = co["vouchers"] or d["vouchers"]
         row = [now_str(), cfg["title"], extract_model_code(d["name"], url), d["name"], d["status"], url,
                d["mrp"], d["sell"], co["final"] or "", co["min"] or "", co["steps"],
-               " | ".join(vouchers)]
-        log(f"    -> {row[2]} | niem yet {d['sell']:,} | cuoi {co['final']:,} | min {co['min']:,}")
+               " | ".join(vouchers), ls or "", "; ".join(notes)]
+        log(f"    -> {row[2]} | niem yet {d['sell']:,} | cuoi {co['final']:,} | min {co['min']:,}"
+            + (f" | {'; '.join(notes)}" if notes else ""))
         rows.append(row)
         writer.writerow(row)
         fh.flush()
