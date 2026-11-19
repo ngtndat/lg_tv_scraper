@@ -1,0 +1,43 @@
+name: LG TV scraper (manual test)
+on:
+  workflow_dispatch:
+    inputs:
+      sites:
+        description: "Site cần quét (DMX,DMCL,NK)"
+        default: "DMX,DMCL,NK"
+      limit:
+        description: "Số sản phẩm tối đa mỗi site (0 = hết)"
+        default: "3"
+      no_checkout:
+        description: "Bỏ qua bước giỏ hàng/voucher (chạy nhanh)"
+        type: boolean
+        default: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install playwright && playwright install --with-deps chromium
+      - name: Run scraper
+        env:
+          SITES: ${{ inputs.sites }}
+          LIMIT: ${{ inputs.limit }}
+          NO_CHECKOUT: ${{ inputs.no_checkout && '--no-checkout' || '' }}
+        run: python lg_tv_scraper.py --sites "$SITES" --limit "$LIMIT" --debug $NO_CHECKOUT --out result.csv
+      - name: Show result in run summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat result.csv >> "$GITHUB_STEP_SUMMARY" || echo "no result.csv" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lg-tv-result
+          path: |
+            result.csv
+            debug_tv/
+          if-no-files-found: warn
